@@ -136,6 +136,7 @@ accumulate_grad_batches = 1
 lr = 5e-5
 local_batch_size = 8
 max_length = 512
+train_size = 100000
 eval_size = 1000
 
 print(f"PyTorch version: {torch.__version__}")
@@ -165,7 +166,7 @@ print(f"GPU available: {torch.cuda.is_available()}")
 
 dataset = datasets.load_dataset('json', data_files={'train': args.train, 'test': args.eval})
 dataset['test'] = dataset['test'].select(range(eval_size))
-# dataset['train'] = dataset['train'].select(range(100000))
+dataset['train'] = dataset['train'].select(range(train_size))
 print(dataset['test'][0])
 print(dataset['test'][-1])
 # print(list(zip(dataset['test']['input'][:10], dataset['test']['output'][:10])))
@@ -193,17 +194,17 @@ print(dataset)
 # print(f"Number of maximum length samples: {truncated}, proportion: {truncated / (len(dataset['train']) + len(dataset['test']))}")
 
 datamodule = OCRDataModule(dataset, tokenizer, local_batch_size)
-steps_train = math.ceil(len(dataset['train']) / (args.gpus*local_batch_size))
+steps_train = math.ceil(train_size / (args.gpus*local_batch_size))
 print(f"Number of training steps: {steps_train}", flush=True)
 
 if args.load_checkpoint:
-    gpt_model = GPTModel.load_from_checkpoint(args.load_checkpoint)
+    # gpt_model = GPTModel.load_from_checkpoint(args.load_checkpoint)
     print(f"Model loaded from checkpoint: {args.load_checkpoint}")
-else:
-    gpt_model = GPTModel(model_name, lr, steps_train)
 
-# checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=1000, monitor='global_step', mode='max', save_top_k=-1, dirpath=args.out_dir, filename='{global_step}')
-checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=1, dirpath=args.out_dir, filename=model_name+'-{epoch}')
+gpt_model = GPTModel(model_name, lr, steps_train)
+
+checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=steps_train, monitor='global_step', mode='max', save_top_k=-1, dirpath=args.out_dir, filename=model_name+'-{global_step}')
+# checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=1, dirpath=args.out_dir, filename=model_name+'-{epoch}')
 
 # fsdp = pl.strategies.DDPFullyShardedNativeStrategy(
 #     cpu_offload=torch.distributed.fsdp.fully_sharded_data_parallel.CPUOffload(offload_params=True),
@@ -224,8 +225,8 @@ trainer = pl.Trainer(
     accumulate_grad_batches=accumulate_grad_batches,
     val_check_interval=500,
     # limit_val_batches=100,
-    max_epochs=1,
-    # max_steps=steps_train,
+    # max_epochs=1,
+    max_steps=steps_train,
     callbacks=[checkpoint_callback, pl.callbacks.TQDMProgressBar(refresh_rate=10)],
     resume_from_checkpoint=args.load_checkpoint
 )
