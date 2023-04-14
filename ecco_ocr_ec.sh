@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --account=Project_2002820
-#SBATCH --time=1:00:00
+#SBATCH --time=8:00:00
 ##SBATCH --time=0:15:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 ##SBATCH --mem-per-cpu=8G
 #SBATCH --cpus-per-task=32
 #SBATCH --partition=gpumedium
-#SBATCH --gres=gpu:a100:4,nvme:64
+#SBATCH --gres=gpu:a100:4,nvme:128
 
 echo "Slurm job ID: $SLURM_JOB_ID"
 echo "Slurm job nodes: $SLURM_JOB_NODELIST"

@@ -13,8 +13,8 @@ import pytorch_lightning as pl
 
 # torch.use_cache = False
 
-model_name = 'gpt2'
-# model_name = 'EleutherAI/gpt-neo-2.7B'
+# model_name = 'gpt2'
+model_name = 'EleutherAI/gpt-neo-2.7B'
 # model_name = 'EleutherAI/gpt-j-6B'
 # model_name = 'EleutherAI/gpt-neox-20b'
 tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
@@ -131,10 +131,10 @@ parser.add_argument('--out_dir', help="A directory to which the model checkpoint
 parser.add_argument('--load_checkpoint', help="A path to a checkpoint file to load.")
 args = parser.parse_args()
 
-accumulate_grad_batches = 1
+accumulate_grad_batches = 8
 # steps_train = 80000
 lr = 5e-5
-local_batch_size = 8
+local_batch_size = 1
 max_length = 512
 train_size = 100000
 eval_size = 1000
@@ -170,7 +170,30 @@ dataset['train'] = dataset['train'].select(range(train_size))
 print(dataset['test'][0])
 print(dataset['test'][-1])
 # print(list(zip(dataset['test']['input'][:10], dataset['test']['output'][:10])))
-print(compute_metrics(predictions=dataset['test']['input'], references=dataset['test']['output']))
+# metrics = evaluate.combine(['character', 'wer'], force_prefix=True)
+# print(metrics.compute(predictions=dataset['test']['input'], references=dataset['test']['output']))
+print(f"Metrics for copying input: {compute_metrics(predictions=dataset['test']['input'], references=dataset['test']['output'])}")
+
+# stride = 10000
+# for split in ['train', 'test']:    
+#     tokenized_dataset = datasets.Dataset.from_dict(dict())
+#     # This slightly complicated approach is necessary to get the desired number of filtered training examples
+#     # without necessarily having to tokenize the entire dataset.
+#     for i in range(0, len(dataset[split]), stride):
+#         # https://huggingface.co/docs/transformers/tasks/language_modeling
+#         subset = dataset[split][i:max(i+stride, len(dataset[split]))]
+#         subset = subset.map(
+#             lambda b: tokenize_with_prefix_length(tokenizer, b),
+#             batched=True,
+#             num_proc=4
+#         )
+# 
+#         subset = subset.remove_columns(['input', 'output'])
+#         # Inputs longer than the maximum length of the model are removed from the dataset.
+#         subset = filter_by_length(dataset, max_length)
+#         tokenized_dataset = datasets.concatenate_datasets([tokenized_dataset, subset])
+#         if len(tokenized_dataset) >= train_size:
+#             break
 
 # https://huggingface.co/docs/transformers/tasks/language_modeling
 # TODO: Replace with code that doesn't result in OOM when attempting to tokenize the entire dataset.
@@ -180,21 +203,17 @@ dataset = dataset.map(
     num_proc=4
 )
 
-# metrics = evaluate.combine(['character', 'wer'], force_prefix=True)
-# print(metrics.compute(predictions=dataset['test']['input'], references=dataset['test']['output']))
-
-# print(dataset['train'][:10])
-# print(dataset['test'][:10])
 dataset = dataset.remove_columns(['input', 'output'])
 # Inputs longer than the maximum length of the model are removed from the dataset.
 dataset = filter_by_length(dataset, max_length)
+
 print(dataset)
 
 # truncated = sum(len(e) == max_length for e in dataset['train']['input_ids'] + dataset['test']['input_ids'])
 # print(f"Number of maximum length samples: {truncated}, proportion: {truncated / (len(dataset['train']) + len(dataset['test']))}")
 
 datamodule = OCRDataModule(dataset, tokenizer, local_batch_size)
-steps_train = math.ceil(train_size / (args.gpus*local_batch_size))
+steps_train = math.ceil(len(dataset['train']) / (args.gpus*local_batch_size*accumulate_grad_batches))
 print(f"Number of training steps: {steps_train}", flush=True)
 
 if args.load_checkpoint:
@@ -238,12 +257,14 @@ trainer.fit(gpt_model, datamodule=datamodule)
 gpt_model.eval()
 gpt_model.cuda()
 if trainer.global_rank == 0:
+    print("Evaluating.")
     predictions = []
     references = []
     for cpu_batch in datamodule.val_dataloader():
         batch = {k: v.cuda() for k, v in cpu_batch.items()}
         # print([(p.shape, p[:l].shape) for p, l in zip(batch['input_ids'], batch['prefix_length'])])
         output = [gpt_model.model.generate(torch.unsqueeze(p[:l], 0), do_sample=False, max_length=max_length).squeeze() for p, l in zip(batch['input_ids'], batch['prefix_length'])]
+        # output = [gpt_model.model.generate(torch.unsqueeze(p[:l], 0), do_sample=True, temperature=0.1, max_length=max_length).squeeze() for p, l in zip(batch['input_ids'], batch['prefix_length'])]
         # print(output)
         # Predictions might not have an EOS token. In these cases, model output is not truncated.
         # for o, l in zip(output, batch['prefix_length']):
