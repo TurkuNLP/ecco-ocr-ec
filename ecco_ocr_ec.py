@@ -5,16 +5,19 @@ import evaluate
 import deepspeed
 import argparse
 import pathlib
-import csv
 import os
-import logging
 import math
 import itertools
+import time
 import pytorch_lightning as pl
+# from lightning_transformers.utilities.deepspeed import enable_transformers_pretrained_deepspeed_sharding
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # torch.use_cache = False
 
 # model_name = 'gpt2'
+# model_name = 'facebook/opt-1.3b'
 model_name = 'EleutherAI/gpt-neo-2.7B'
 # model_name = 'EleutherAI/gpt-j-6B'
 # model_name = 'EleutherAI/gpt-neox-20b'
@@ -30,11 +33,27 @@ class GPTModel(pl.LightningModule):
     def __init__(self, model_name, lr, steps_train):
         super().__init__()
         self.save_hyperparameters()
-        self.model = transformers.AutoModelForCausalLM.from_pretrained(model_name)
         self.lr = lr
         self.steps_train = steps_train
+        self.model = transformers.AutoModelForCausalLM.from_pretrained(model_name)
+        # self.config = transformers.AutoConfig.from_pretrained(model_name)
+        # self.model_name = model_name
+        # weights_path = huggingface_hub.hf_hub_download(model_name, 'pytorch_model.bin')
+        # with accelerate.init_empty_weights():
+        #     self.model = transformers.AutoModelForCausalLM.from_config(self.config)
+        # self.model.tie_weights()
+        # self.model = accelerate.load_checkpoint_and_dispatch(self.model, weights_path, device_map='auto', no_split_module_classes=['GPTJBlock'])
 
     # def configure_sharded_model(self):
+    #     self.model = transformers.AutoModelForCausalLM.from_config(self.config)
+
+    # TODO: Shard model on GPU.
+    # https://lightning-transformers.readthedocs.io/en/latest/features/large_model_training.html
+    # See also: https://github.com/Lightning-AI/lightning/issues/17043
+    # def setup(self, stage):
+    #     if not hasattr(self, 'model'):
+    #         enable_transformers_pretrained_deepspeed_sharding(self)
+    #         self.model = transformers.AutoModelForCausalLM.from_pretrained(self.model_name)
 
     def forward(self, batch):
         return self.model(input_ids=batch['input_ids'],
@@ -51,11 +70,15 @@ class GPTModel(pl.LightningModule):
         #     print(batch, flush=True)
         self.log('val_loss', self(batch).loss, prog_bar=True, sync_dist=True)
 
+    def predict_step(self, batch):
+        output = [self.model.generate(torch.unsqueeze(p[:l], 0), do_sample=False, max_length=max_length).squeeze() for p, l in zip(batch['input_ids'], batch['prefix_length'])]
+
     def configure_optimizers(self):
         # Instead of self.parameters(), self.trainer.model.parameters() must be used with FSDP auto-wrapping.
         # See: https://pytorch-lightning.readthedocs.io/en/stable/advanced/model_parallel.html#auto-wrapping
         # optimizer = transformers.optimization.AdamW(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
         optimizer = deepspeed.ops.adam.FusedAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
+        # optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
         scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=self.steps_train)
         scheduler = {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
         return [optimizer], [scheduler]
@@ -94,12 +117,16 @@ class OCRDataModule(pl.LightningDataModule):
         # With DDP, PyTorch Lightning wraps the Dataloader with DistributedSampler automatically.
         # With FSDP, it seems this has to be done manually.
         sampler = torch.utils.data.distributed.DistributedSampler(torch_dataset, shuffle=True)
-        return torch.utils.data.DataLoader(torch_dataset, collate_fn=PromptMaskingDataCollator(tokenizer=self.tokenizer, mlm=False), batch_size=self.batch_size, sampler=sampler, num_workers=1, pin_memory=True)
+        dataloader = torch.utils.data.DataLoader(torch_dataset, collate_fn=PromptMaskingDataCollator(tokenizer=self.tokenizer, mlm=False), batch_size=self.batch_size, sampler=sampler, num_workers=1, pin_memory=True)
+        print(f"Training dataset size: {len(self.dataset['train'])}, dataloader size: {len(dataloader)}")
+        return dataloader
 
     def val_dataloader(self):
         torch_dataset = OCRDataSet(self.dataset['test'])
-        sampler = torch.utils.data.distributed.DistributedSampler(torch_dataset, shuffle=False)
-        return torch.utils.data.DataLoader(torch_dataset, collate_fn=PromptMaskingDataCollator(tokenizer=self.tokenizer, mlm=False), batch_size=self.batch_size, sampler=sampler, num_workers=1, pin_memory=True)
+        # sampler = torch.utils.data.distributed.DistributedSampler(torch_dataset, shuffle=False)
+        dataloader = torch.utils.data.DataLoader(torch_dataset, collate_fn=PromptMaskingDataCollator(tokenizer=self.tokenizer, mlm=False), batch_size=self.batch_size, num_workers=1, pin_memory=True, shuffle=False)
+        print(f"Dataset size: {len(self.dataset['test'])}, dataloader size: {len(dataloader)}")
+        return dataloader
 
 def filter_by_length(datasetdict, max_length):
     for k in datasetdict:
@@ -113,8 +140,10 @@ def filter_by_length(datasetdict, max_length):
     return datasetdict
 
 def compute_metrics(predictions, references):
+    # start = time.time()
     cer = evaluate.load('character').compute(predictions=predictions, references=references)
     wer = evaluate.load('wer').compute(predictions=predictions, references=references)
+    # print(f"Time to evaluate all at once: {time.time() - start} s")
     return {'cer': cer['cer_score'], 'wer': wer}
 
 def tokenize_with_prefix_length(tokenizer, b):
@@ -133,10 +162,10 @@ if __name__ == '__main__':
     parser.add_argument('--load_checkpoint', help="A path to a checkpoint file to load.")
     args = parser.parse_args()
 
-    accumulate_grad_batches = 1
+    accumulate_grad_batches = 2
     # steps_train = 80000
-    lr = 5e-5
-    local_batch_size = 2
+    lr = 2e-5
+    local_batch_size = 1
     max_length = 2048
     train_size = 100000
     eval_size = 1000
@@ -169,13 +198,21 @@ if __name__ == '__main__':
 
     dataset = datasets.load_dataset('json', data_files={'train': args.train, 'test': args.eval})
     dataset['test'] = dataset['test'].select(range(eval_size))
-    dataset['train'] = dataset['train'].select(range(train_size))
-    print(dataset['test'][0])
-    print(dataset['test'][-1])
+    # dataset['train'] = dataset['train'].select(range(min(train_size, len(dataset['train']))))
+    # print(dataset['test'][0])
+    # print(dataset['test'][-1])
     # print(list(zip(dataset['test']['input'][:10], dataset['test']['output'][:10])))
     # metrics = evaluate.combine(['character', 'wer'], force_prefix=True)
     # print(metrics.compute(predictions=dataset['test']['input'], references=dataset['test']['output']))
+    print(dataset)
     print(f"Metrics for copying input: {compute_metrics(predictions=dataset['test']['input'], references=dataset['test']['output'])}")
+    # dataset = dataset.map(
+    #         lambda d: {k: v.replace('ſ', 's') for k, v in d.items()},
+    #         num_proc=4
+    # )
+    # print(dataset)
+    # print(dataset['test'][0])
+    # print(dataset['test'][-1])
 
     # stride = 10000
     # for split in ['train', 'test']:    
@@ -215,7 +252,7 @@ if __name__ == '__main__':
     # print(f"Number of maximum length samples: {truncated}, proportion: {truncated / (len(dataset['train']) + len(dataset['test']))}")
 
     datamodule = OCRDataModule(dataset, tokenizer, local_batch_size)
-    steps_train = math.ceil(len(dataset['train']) / (args.gpus*local_batch_size*accumulate_grad_batches))
+    steps_train = math.ceil(train_size / (args.gpus*local_batch_size*accumulate_grad_batches))
     print(f"Number of training steps: {steps_train}", flush=True)
 
     if args.load_checkpoint:
@@ -224,8 +261,11 @@ if __name__ == '__main__':
 
     gpt_model = GPTModel(model_name, lr, steps_train)
 
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=steps_train, monitor='global_step', mode='max', save_top_k=-1, dirpath=args.out_dir, filename=model_name+'-{global_step}')
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=steps_train, monitor='global_step', mode='max', save_top_k=-1, dirpath=args.out_dir, filename=(model_name+'-{global_step}').replace('/', '_'))
+    checkpoint_epoch_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=1, save_on_train_epoch_end=True, save_top_k=-1, dirpath=args.out_dir, filename=(model_name+'-{epoch}').replace('/', '_'))
     # checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=1, dirpath=args.out_dir, filename=model_name+'-{epoch}')
+
+    logger = pl.loggers.TensorBoardLogger('tb_logs', name=f"{model_name}-{train_size}".replace('/', '_'))
 
     # fsdp = pl.strategies.DDPFullyShardedNativeStrategy(
     #     cpu_offload=torch.distributed.fsdp.fully_sharded_data_parallel.CPUOffload(offload_params=True),
@@ -245,10 +285,11 @@ if __name__ == '__main__':
         # gradient_clip_val=1.0,
         accumulate_grad_batches=accumulate_grad_batches,
         val_check_interval=100,
-        # limit_val_batches=100,
+        # limit_val_batches=0.0,
         # max_epochs=1,
         max_steps=steps_train,
-        callbacks=[checkpoint_callback, pl.callbacks.TQDMProgressBar(refresh_rate=10)],
+        callbacks=[checkpoint_callback, checkpoint_epoch_callback, pl.callbacks.TQDMProgressBar(refresh_rate=10)],
+        logger=logger
     )
 
     print(trainer.global_rank, trainer.world_size, os.environ['SLURM_NTASKS'])
@@ -256,16 +297,18 @@ if __name__ == '__main__':
     trainer.fit(gpt_model, datamodule=datamodule, ckpt_path=args.load_checkpoint)
 
     gpt_model.eval()
-    save_dir = f'{args.out_dir}/{model_name}'
+    save_dir = f'{args.out_dir}/{model_name.replace("/", "_")}'
     gpt_model.model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
     gpt_model.cuda()
     if trainer.global_rank == 0:
         print("Evaluating.")
+        start = time.time()
         prefixes = []
         predictions = []
         references = []
         for cpu_batch in datamodule.val_dataloader():
+            batch_start = time.time()
             batch = {k: v.cuda() for k, v in cpu_batch.items()}
             # print([(p.shape, p[:l].shape) for p, l in zip(batch['input_ids'], batch['prefix_length'])])
             output = [gpt_model.model.generate(torch.unsqueeze(p[:l], 0), do_sample=False, max_length=max_length).squeeze() for p, l in zip(batch['input_ids'], batch['prefix_length'])]
@@ -276,14 +319,21 @@ if __name__ == '__main__':
             #     print([torch.nonzero(o == tokenizer.eos_token_id), torch.tensor([[max_length]])])
             max_value = torch.tensor([[max_length]]).cuda()
             prefixes += [p[:l] for p, l in zip(batch['input_ids'], batch['prefix_length'])]
-            predictions += [o[l:torch.concat([torch.nonzero(o == tokenizer.eos_token_id), max_value])[0]] for o, l in zip(output, batch['prefix_length'])]
+            batch_prediction = [o[l:torch.concat([torch.nonzero(o == tokenizer.eos_token_id), max_value])[0]] for o, l in zip(output, batch['prefix_length'])]
+            predictions += batch_prediction
             references += [o[l:torch.nonzero(o == tokenizer.eos_token_id)[0]] for o, l in zip(batch['input_ids'], batch['prefix_length'])]
+            print(f"Generation with batch size of {batch['input_ids'].shape} and lengths {[len(s) for s in batch_prediction]} complete in {time.time() - batch_start} s", flush=True)
 
+        print(f"Time elapsed during generation: {time.time() - start} s")
         # print(predictions)
         # print(references)
+        print(f"Average prediction length: {sum(len(s) for s in predictions) / len(predictions)}")
+        print(f"Average reference length: {sum(len(s) for s in references) / len(references)}")
+        decode_start = time.time()
         prefixes = tokenizer.batch_decode(prefixes)
         predictions = tokenizer.batch_decode(predictions)    
         references = tokenizer.batch_decode(references)
+        print(f"Time elapsed during decoding: {time.time() - decode_start} s")
 
         for prefix, prediction, reference in itertools.islice(zip(prefixes, predictions, references), 10):
             print(prefix)
@@ -291,4 +341,32 @@ if __name__ == '__main__':
             print(reference)
             print()
         
-        print(compute_metrics(predictions=predictions, references=references))
+        metrics = compute_metrics(predictions=predictions, references=references)
+        # start_individual = time.time()
+        cer_scores, wer_scores = [[metric.compute(predictions=[p], references=[r]) for p, r in zip(predictions, references)] for metric in [evaluate.load('cer'), evaluate.load('wer')]]
+        # print(f"Time to evaluate individually: {time.time() - start_individual} s")
+
+        print(f"CER: {metrics['cer']}, WER: {metrics['wer']}, CER (from individual): {sum(cer_scores)/len(cer_scores)}, WER (from individual): {sum(wer_scores)/len(wer_scores)}")
+        print(f"Validation size: {len(datamodule.dataset['test'])}, dataloader size: {len(datamodule.val_dataloader())}, number of predictions: {len(predictions)}, number of references: {len(references)}, number of cer scores: {len(cer_scores)}, number of wer scores: {len(wer_scores)}")
+        print(f"CER scores: {cer_scores}")
+        print(f"WER scores: {wer_scores}")
+        print(f"CER mean: {torch.mean(torch.tensor(cer_scores))}, stdev: {torch.std(torch.tensor(cer_scores))}")
+        print(f"WER mean: {torch.mean(torch.tensor(wer_scores))}, stdev: {torch.std(torch.tensor(wer_scores))}")
+
+        print(f"Total time elapsed during evaluation: {time.time() - start} s")
+
+        plots = False
+        if plots:
+            path = pathlib.Path('plots')
+            ax1 = sns.histplot(cer_scores, log_scale=False)
+            ax1.set_xscale('symlog', linthresh=1)
+            ax1.set_xlabel('CER')
+            plt.show()
+            plt.savefig(path / 'cer_histogram.pdf')
+            plt.close()
+            ax2 = sns.histplot(wer_scores, log_scale=False)
+            ax2.set_xscale('symlog', linthresh=1)
+            ax2.set_xlabel('WER')
+            plt.show()
+            plt.savefig(path / 'wer_histogram.pdf')
+            plt.close()
