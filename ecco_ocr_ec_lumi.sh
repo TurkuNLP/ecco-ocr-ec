@@ -1,13 +1,14 @@
 #!/bin/bash
 #SBATCH --account=Project_462000241
-#SBATCH --time=24:00:00
+#SBATCH --time=1:00:00
 ##SBATCH --time=0:15:00
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH --mem=384G
-#SBATCH --partition=standard-g
+#SBATCH --mem=480G
+#SBATCH --partition=small-g
 #SBATCH --gpus-per-task=mi250:1
+#SBATCH --exclusive
 
 echo "Slurm job ID: $SLURM_JOB_ID"
 echo "Slurm job nodes: $SLURM_JOB_NODELIST"
@@ -54,11 +55,13 @@ export HF_HOME=$TMPDIR
 # export HF_DATASETS_CACHE=$TMPDIR
 export TRANSFORMERS_CACHE=/scratch/project_462000241/rastasii/transformers_cache
 # export OMP_NUM_THREADS=8
+export HF_EVALUATE_OFFLINE=1
 
 # nvcc --version
 python -m deepspeed.env_report
+pip show transformers
 
-NNODES=1
+NNODES=4
 NGPUS=8
 
 TRAIN=$1 # A .jsonl.gz file containing the training samples as {'input', 'output'}.
@@ -70,6 +73,11 @@ cat > $TMPDIR/copy_script.sh << "EOF"
 echo "Temporary directory: $1"
 gzip -dc $2 > $1/train.jsonl
 gzip -dc $3 > $1/eval.jsonl
+
+# Copy the evaluation metrics for offline use.
+cp -r libs/evaluate/metrics/character .
+cp -r libs/evaluate/metrics/wer .
+
 echo "Copied training data to $TMPDIR" 
 EOF
 

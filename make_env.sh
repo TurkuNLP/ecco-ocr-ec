@@ -1,6 +1,10 @@
 module purge
 module load cray-python
 
+mkdir libs
+git clone https://github.com/huggingface/evaluate.git
+mv evaluate libs
+
 python -m venv env
 source env/bin/activate
 pip install --upgrade pip setuptools wheel

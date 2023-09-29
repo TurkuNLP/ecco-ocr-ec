@@ -18,9 +18,9 @@ import seaborn as sns
 
 # model_name = 'gpt2'
 # model_name = 'facebook/opt-1.3b'
-model_name = 'EleutherAI/gpt-neo-2.7B'
+# model_name = 'EleutherAI/gpt-neo-2.7B'
 # model_name = 'EleutherAI/gpt-j-6B'
-# model_name = 'EleutherAI/gpt-neox-20b'
+model_name = 'EleutherAI/gpt-neox-20b'
 tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
 # Note: if the model is moved to GPU here by using .cuda(), all of the processes in the node end up
@@ -35,25 +35,28 @@ class GPTModel(pl.LightningModule):
         self.save_hyperparameters()
         self.lr = lr
         self.steps_train = steps_train
-        self.model = transformers.AutoModelForCausalLM.from_pretrained(model_name)
+        self.model_name = model_name
         # self.config = transformers.AutoConfig.from_pretrained(model_name)
-        # self.model_name = model_name
         # weights_path = huggingface_hub.hf_hub_download(model_name, 'pytorch_model.bin')
         # with accelerate.init_empty_weights():
         #     self.model = transformers.AutoModelForCausalLM.from_config(self.config)
         # self.model.tie_weights()
         # self.model = accelerate.load_checkpoint_and_dispatch(self.model, weights_path, device_map='auto', no_split_module_classes=['GPTJBlock'])
 
-    # def configure_sharded_model(self):
-    #     self.model = transformers.AutoModelForCausalLM.from_config(self.config)
-
-    # TODO: Shard model on GPU.
+    # Shard model on GPU.
     # https://lightning-transformers.readthedocs.io/en/latest/features/large_model_training.html
     # See also: https://github.com/Lightning-AI/lightning/issues/17043
-    # def setup(self, stage):
-    #     if not hasattr(self, 'model'):
-    #         enable_transformers_pretrained_deepspeed_sharding(self)
-    #         self.model = transformers.AutoModelForCausalLM.from_pretrained(self.model_name)
+    # See also: https://huggingface.co/docs/transformers/main_classes/deepspeed#nontrainer-deepspeed-integration
+    # See also: https://discuss.huggingface.co/t/fine-tuning-t5-with-long-sequence-length-using-activation-checkpointing-with-deepspeed/27236
+    def setup(self, stage):
+        if not hasattr(self, 'model'):
+            # enable_transformers_pretrained_deepspeed_sharding(self)
+            # transformers.deepspeed._hf_deepspeed_config_weak_ref = self.dsconfig
+            # self.trainer.strategy.config['comms_logger'] = {'enabled': True, 'verbose': True, 'prof_all': True, 'debug': False}
+            self.dsconfig = transformers.deepspeed.HfDeepSpeedConfig(self.trainer.strategy.config)
+            self.model = transformers.AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=torch.float16)
+            self.model.gradient_checkpointing_enable()
+            print(f"DeepSpeed configuration: {self.trainer.strategy.config}")
 
     def forward(self, batch):
         return self.model(input_ids=batch['input_ids'],
@@ -77,8 +80,8 @@ class GPTModel(pl.LightningModule):
         # Instead of self.parameters(), self.trainer.model.parameters() must be used with FSDP auto-wrapping.
         # See: https://pytorch-lightning.readthedocs.io/en/stable/advanced/model_parallel.html#auto-wrapping
         # optimizer = transformers.optimization.AdamW(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
-        optimizer = deepspeed.ops.adam.FusedAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
-        # optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
+        # optimizer = deepspeed.ops.adam.FusedAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
+        optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
         scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=self.steps_train)
         scheduler = {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
         return [optimizer], [scheduler]
@@ -162,12 +165,12 @@ if __name__ == '__main__':
     parser.add_argument('--load_checkpoint', help="A path to a checkpoint file to load.")
     args = parser.parse_args()
 
-    accumulate_grad_batches = 2
+    accumulate_grad_batches = 1
     # steps_train = 80000
     lr = 2e-5
     local_batch_size = 1
     max_length = 2048
-    train_size = 100000
+    train_size = 10000
     eval_size = 1000
 
     print(f"PyTorch version: {torch.__version__}")
@@ -252,7 +255,7 @@ if __name__ == '__main__':
     # print(f"Number of maximum length samples: {truncated}, proportion: {truncated / (len(dataset['train']) + len(dataset['test']))}")
 
     datamodule = OCRDataModule(dataset, tokenizer, local_batch_size)
-    steps_train = math.ceil(train_size / (args.gpus*local_batch_size*accumulate_grad_batches))
+    steps_train = math.ceil(train_size / (args.nodes*args.gpus*local_batch_size*accumulate_grad_batches))
     print(f"Number of training steps: {steps_train}", flush=True)
 
     if args.load_checkpoint:
@@ -279,12 +282,15 @@ if __name__ == '__main__':
         devices=args.gpus,
         # auto_select_gpus=True,
         # strategy=fsdp,
-        strategy='deepspeed_stage_2',
-        # precision=16,
+        # strategy=pl.strategies.DeepSpeedStrategy(stage=3, offload_optimizer=True, partition_activations=True),
+        # strategy=pl.strategies.DeepSpeedStrategy(stage=3, offload_optimizer=True, sub_group_size=1e11, allgather_bucket_size=2e7, reduce_bucket_size=2e7),
+        # strategy=pl.strategies.DeepSpeedStrategy(stage=3, sub_group_size=10000000000, allgather_bucket_size=2000000, reduce_bucket_size=2000000),
+        strategy='deepspeed_stage_3',
+        precision=16,
         # gradient_clip_algorithm='norm',
         # gradient_clip_val=1.0,
         accumulate_grad_batches=accumulate_grad_batches,
-        val_check_interval=100,
+        val_check_interval=50,
         # limit_val_batches=0.0,
         # max_epochs=1,
         max_steps=steps_train,
