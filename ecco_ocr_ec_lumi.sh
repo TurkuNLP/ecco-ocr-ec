@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --account=Project_462000241
-#SBATCH --time=1:00:00
+#SBATCH --time=72:00:00
 ##SBATCH --time=0:15:00
-#SBATCH --nodes=4
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH --mem=480G
@@ -17,7 +17,9 @@ export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export LOCAL_SCRATCH=/tmp
 
 module purge
-module load cray-python
+# module load cray-python
+module use /appl/local/csc/modulefiles
+module load pytorch
 # export PYTHONUSERBASE=/projappl/project_2000539/rastasii/ecco-ocr-ec/user-env
 # pip install --user --ignore-installed pytorch-lightning
 # pip install --user --upgrade pip
@@ -51,6 +53,7 @@ echo $CUDA_VISIBLE_DEVICES
 
 export TMPDIR=$LOCAL_SCRATCH
 # export PYTORCH_PRETRAINED_BERT_CACHE=$TMPDIR
+export TORCH_HOME=/flash/project_462000241/rastasii
 export HF_HOME=$TMPDIR
 # export HF_DATASETS_CACHE=$TMPDIR
 export TRANSFORMERS_CACHE=/scratch/project_462000241/rastasii/transformers_cache
@@ -61,7 +64,7 @@ export HF_EVALUATE_OFFLINE=1
 python -m deepspeed.env_report
 pip show transformers
 
-NNODES=4
+NNODES=1
 NGPUS=8
 
 TRAIN=$1 # A .jsonl.gz file containing the training samples as {'input', 'output'}.
