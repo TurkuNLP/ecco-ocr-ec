@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --account=Project_462000241
-#SBATCH --time=72:00:00
+#SBATCH --account=Project_462000347
+#SBATCH --time=3:00:00
 ##SBATCH --time=0:15:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
@@ -13,11 +13,14 @@
 echo "Slurm job ID: $SLURM_JOB_ID"
 echo "Slurm job nodes: $SLURM_JOB_NODELIST"
 
-export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
+export NCCL_SOCKET_IFNAME=hsn
 export LOCAL_SCRATCH=/tmp
 
 module purge
+# module load LUMI partition/container EasyBuild-user
 # module load cray-python
+# eb PyTorch-2.1.0-rocm-5.6.1-python-3.10-singularity-20231123.eb
+# module load PyTorch/2.1.0-rocm-5.6.1-python-3.10-singularity-20231123
 module use /appl/local/csc/modulefiles
 module load pytorch
 # export PYTHONUSERBASE=/projappl/project_2000539/rastasii/ecco-ocr-ec/user-env
@@ -47,9 +50,22 @@ module load pytorch
 # srun --ntasks=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 bash $LOCAL_SCRATCH/make_env.sh
 # source $LOCAL_SCRATCH/env/bin/activate
 
+# rm -r env_2
+# bash make_env.sh
 source env/bin/activate
 
-echo $CUDA_VISIBLE_DEVICES
+# echo "SIF: $SIF"
+# echo "RUNSCRIPTS: $RUNSCRIPTS"
+# ls $RUNSCRIPTS
+
+# export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "HIP_PATH: $HIP_PATH"
+echo "HSA_PATH: $HSA_PATH"
+echo "HIP_ROCCLR_HOME: $HIP_ROCCLR_HOME"
+echo "HIP_CLANG_PATH: $HIP_CLANG_PATH"
+echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 
 export TMPDIR=$LOCAL_SCRATCH
 # export PYTORCH_PRETRAINED_BERT_CACHE=$TMPDIR
@@ -61,8 +77,11 @@ export TRANSFORMERS_CACHE=/scratch/project_462000241/rastasii/transformers_cache
 export HF_EVALUATE_OFFLINE=1
 
 # nvcc --version
+# rocminfo
+which python
 python -m deepspeed.env_report
 pip show transformers
+pip show accelerate
 
 NNODES=1
 NGPUS=8
@@ -86,6 +105,7 @@ EOF
 
 chmod u+x $TMPDIR/copy_script.sh
 sbcast $TMPDIR/copy_script.sh{,}
+
 echo "Copying training data to NVMe."
 SECONDS=0
 # srun --ntasks=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 gzip -dc $TRAIN | sponge $TMPDIR/train.jsonl
@@ -100,8 +120,13 @@ wc -l $TMPDIR/eval.jsonl
 # https://docs.csc.fi/support/tutorials/ml-multi/
 if [ $# -eq 3 ]
 then
+    # srun --label singularity exec -B "/appl:/appl" -B "$SCRATCH:$LOCAL_SCRATCH" $SIF $RUNSCRIPTS/conda-python-simple ecco_ocr_ec.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR
     srun --label python ecco_ocr_ec.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR
 elif [ $# -eq 4 ]
 then
-    srun --label python ecco_ocr_ec.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR --load_checkpoint $4
+    python $4/zero_to_fp32.py $4 $4/pytorch_model.bin
+    # srun --label python ecco_ocr_ec.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR --load_checkpoint $4
+    # scontrol show hostnames "$SLURM_JOB_NODELIST"
+    # export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+    python -m accelerate.commands.launch --num_processes $(($NNODES * $NGPUS)) ecco_ocr_ec_eval.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR --load_checkpoint $4
 fi

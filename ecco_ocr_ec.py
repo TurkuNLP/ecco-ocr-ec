@@ -20,10 +20,12 @@ import seaborn as sns
 # model_name = 'facebook/opt-1.3b'
 # model_name = 'facebook/opt-13b'
 # model_name = 'EleutherAI/gpt-neo-2.7B'
-model_name = 'EleutherAI/gpt-j-6B'
-# model_name = 'EleutherAI/gpt-neox-20b'
+# model_name = 'EleutherAI/gpt-j-6B'
+model_name = 'EleutherAI/gpt-neox-20b'
 # model_name = 'EleutherAI/pythia-6.9b'
 # model_name = 'EleutherAI/pythia-12b'
+# model_name = 'stabilityai/stablelm-base-alpha-7b-v2'
+# model_name = 'moreh/MoMo-70B-lora-1.8.6-DPO'
 tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
 # print(f"Pad token: {tokenizer.pad_token}")
@@ -60,7 +62,7 @@ class GPTModel(pl.LightningModule):
             # self.trainer.strategy.config['comms_logger'] = {'enabled': True, 'verbose': True, 'prof_all': True, 'debug': False}
             print(f"DeepSpeed configuration: {self.trainer.strategy.config}")
             self.dsconfig = transformers.deepspeed.HfDeepSpeedConfig(self.trainer.strategy.config)
-            self.model = transformers.AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=torch.float16)
+            self.model = transformers.AutoModelForCausalLM.from_pretrained(self.model_name, trust_remote_code=False, torch_dtype=torch.float32, use_cache=True)
             self.model.gradient_checkpointing_enable()
 
     def forward(self, batch):
@@ -73,6 +75,7 @@ class GPTModel(pl.LightningModule):
         # return out
 
     def training_step(self, batch):
+        # print(deepspeed.comm.log_summary())
         out = self(batch)
         self.log_dict({'loss': out.loss, 'global_step': self.trainer.global_step}, sync_dist=True)
         return out.loss
@@ -83,8 +86,11 @@ class GPTModel(pl.LightningModule):
         self.log('val_loss', self(batch).loss, prog_bar=True, sync_dist=True)
 
     def predict_step(self, batch, batch_idx):
+        # print(f"Batch in predict_step: {batch}")
         max_value = torch.tensor([[max_length]]).cuda()
+        # print("Batch devices: ", {k: batch[k].get_device() for k in batch.keys()})
         output = [self.model.generate(torch.unsqueeze(p[:l], 0), do_sample=False, max_length=max_length).squeeze() for p, l in zip(batch['input_ids'], batch['prefix_length'])]
+
         # print(f"Output in predict_step: {output}", flush=True)
         # print(batch['input_ids'][0][:batch['prefix_length']])
         # print(f"Number of EOS tokens: {torch.sum(batch['input_ids'][0][:batch['prefix_length']] == tokenizer.eos_token_id)}")
@@ -95,7 +101,8 @@ class GPTModel(pl.LightningModule):
         # Instead of self.parameters(), self.trainer.model.parameters() must be used with FSDP auto-wrapping.
         # See: https://pytorch-lightning.readthedocs.io/en/stable/advanced/model_parallel.html#auto-wrapping
         # optimizer = transformers.optimization.AdamW(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
-        optimizer = deepspeed.ops.adam.FusedAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
+        # optimizer = deepspeed.ops.adam.FusedAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
+        optimizer = torch.optim.AdamW(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
         # optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
         scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=self.steps_train)
         scheduler = {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
@@ -180,13 +187,18 @@ class PredWriter(pl.callbacks.BasePredictionWriter):
         print(f"Number of predictions in PredWriter: {len(predictions)}")
         print(f"Value of batch_idx: {batch_idx}")
         print(len(predictions))
+        print(type(predictions))
+        print([p.get_device() for b in predictions for p in b])
         predictions_gathered = [None]*torch.distributed.get_world_size()
         torch.distributed.all_gather_object(predictions_gathered, predictions)
+        
         batch_idx_gathered = [None]*torch.distributed.get_world_size()
         torch.distributed.all_gather_object(batch_idx_gathered, batch_idx)
         torch.distributed.barrier()
         if not trainer.is_global_zero:
             return
+        print(f"Value of batch_idx_gathered: {batch_idx_gathered}")
+        print(f"Value of predictions_gathered: {predictions_gathered}")
         predictions_gathered = tokenizer.batch_decode([p for b in predictions_gathered for t in b for p in t])
         batch_idx_gathered = [n for b in batch_idx_gathered for t in b for l in t for n in l]
         print(f"Number of gathered predictions in PredWriter: {len(predictions_gathered)}, number of references: {len(self.references)}")
@@ -196,35 +208,6 @@ class PredWriter(pl.callbacks.BasePredictionWriter):
             print([p[:100]])
             print([r[:100]])
             print()
-
-        metrics = compute_metrics(predictions=predictions_gathered, references=self.references)
-        cer_scores, wer_scores = [[metric.compute(predictions=[p], references=[r]) for p, r in zip(predictions_gathered, self.references)] for metric in [evaluate.load('character'), evaluate.load('wer')]]
-        cer_scores = [s['cer_score'] for s in cer_scores]
-
-        print(f"Average prediction length: {sum(len(s) for s in predictions) / len(predictions)}")
-        print(f"Average reference length: {sum(len(s) for s in references) / len(references)}")
-        print(f"CER: {metrics['cer']}, WER: {metrics['wer']}, CER (from individual): {sum(cer_scores)/len(cer_scores)}, WER (from individual): {sum(wer_scores)/len(wer_scores)}")
-        print(f"Validation size: {len(datamodule.dataset['test'])}, dataloader size: {len(datamodule.val_dataloader())}, number of predictions: {len(predictions_gathered)}, number of references: {len(self.references)}, number of cer scores: {len(cer_scores)}, number of wer scores: {len(wer_scores)}")
-        print(f"CER scores: {' '.join(f'{n:.4f}' for n in cer_scores)}")
-        print(f"WER scores: {' '.join(f'{n:.4f}' for n in wer_scores)}")
-        print(f"CER mean: {torch.mean(torch.tensor(cer_scores))}, stdev: {torch.std(torch.tensor(cer_scores))}")
-        print(f"WER mean: {torch.mean(torch.tensor(wer_scores))}, stdev: {torch.std(torch.tensor(wer_scores))}")
-
-        plots = True
-        if plots:
-            path = pathlib.Path('plots')
-            ax1 = sns.histplot(cer_scores, log_scale=False)
-            ax1.set_xscale('symlog', linthresh=1)
-            ax1.set_xlabel('CER')
-            plt.show()
-            plt.savefig(path / 'cer_histogram.pdf')
-            plt.close()
-            ax2 = sns.histplot(wer_scores, log_scale=False)
-            ax2.set_xscale('symlog', linthresh=1)
-            ax2.set_xlabel('WER')
-            plt.show()
-            plt.savefig(path / 'wer_histogram.pdf')
-            plt.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -253,6 +236,8 @@ if __name__ == '__main__':
     print(f"Number of evaluation examples: {eval_size}")
     print(f"CUDA version: {torch.version.cuda}")
     print(f"GPU available: {torch.cuda.is_available()}")
+
+    # torch.set_float32_matmul_precision('medium')
 
     # train_fns = [p for p in pathlib.Path(args.train).iterdir() if p.is_file()]
 
@@ -332,6 +317,7 @@ if __name__ == '__main__':
 
     if args.load_checkpoint:
         # gpt_model = GPTModel.load_from_checkpoint(args.load_checkpoint)
+        model_name = args.load_checkpoint
         print(f"Model loaded from checkpoint: {args.load_checkpoint}")
 
     gpt_model = GPTModel(model_name, lr, steps_train)
@@ -353,6 +339,48 @@ if __name__ == '__main__':
     #     # activation_checkpointing=transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoBlock
     # )
 
+    dsconfig = {
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {
+                "device": 'none',
+                "pin_memory": True
+            },
+            "offload_param": {
+                "device": 'cpu',
+                "pin_memory": True
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "sub_group_size": 1e12,
+            "reduce_bucket_size": "auto",
+            "stage3_prefetch_bucket_size": "auto",
+            "stage3_param_persistence_threshold": "auto",
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9,
+            "stage3_gather_16bit_weights_on_model_save": True
+        },
+        'bf16': {
+            'enabled': False
+        },
+        "fp16": {
+            "enabled": False,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "initial_scale_power": 16,
+            "hysteresis": 2,
+            "consecutive_hysteresis": False,
+            "min_loss_scale": 1
+        },
+        'zero_allow_untested_optimizer': False,
+        'comms_logger': {
+            'enabled': False,
+            'verbose': False,
+            'prof_all': False,
+            'debug': False
+        }
+    }
+
     trainer = pl.Trainer(
         num_nodes=args.nodes,
         accelerator='gpu',
@@ -361,9 +389,10 @@ if __name__ == '__main__':
         # strategy=fsdp,
         # strategy=pl.strategies.DeepSpeedStrategy(stage=3, offload_optimizer=True, partition_activations=True),
         # strategy=pl.strategies.DeepSpeedStrategy(stage=3, offload_optimizer=True, sub_group_size=1e11, allgather_bucket_size=2e7, reduce_bucket_size=2e7),
-        # strategy=pl.strategies.DeepSpeedStrategy(stage=3, sub_group_size=10000000000, allgather_bucket_size=2000000, reduce_bucket_size=2000000),
-        strategy='deepspeed_stage_2',
-        precision=16,
+        # strategy=pl.strategies.DeepSpeedStrategy(stage=3, reduce_bucket_size='auto'),
+        strategy=pl.strategies.DeepSpeedStrategy(config=dsconfig),
+        # strategy='deepspeed_stage_2',
+        precision=32,
         # gradient_clip_algorithm='norm',
         # gradient_clip_val=1.0,
         accumulate_grad_batches=accumulate_grad_batches,
@@ -380,19 +409,30 @@ if __name__ == '__main__':
     trainer.fit(gpt_model, datamodule=datamodule, ckpt_path=args.load_checkpoint)
 
     # Use predict_step to speed up evaluation.
-    print("Evaluating.")
-    start = time.time()
-    trainer.predict(gpt_model, datamodule.val_dataloader(), ckpt_path=args.load_checkpoint)
-    print(f"Time elapsed during evaluation: {time.time() - start} s")
+    # print("Evaluating.")
+    # start = time.time()
+    # trainer.predict(gpt_model, datamodule.val_dataloader())
+    # TODO: Compare performance between setting use_cache to True or leaving it as False.
+    # gpt_model.model.config.use_cache = True
+    # print(f"Validation dataloader length: {len(datamodule.val_dataloader())}")
+    # print(f"Dataset length: {len(dataset['test'])}")
+    # trainer.predict(gpt_model, [])
+    
+    # save_dir = f'{args.out_dir}/{model_name.replace("/", "_")}_{time.strftime("%Y-%m-%d")}'
+    # gpt_model.model.save_pretrained(save_dir)
+    # gpt_model.model.config.save_pretrained(save_dir)
+    # tokenizer.save_pretrained(save_dir)
+
+    # gpt_model.eval()
+    # gpt_model.cuda()
+
+    # print(f"Time elapsed during evaluation: {time.time() - start} s")
     # print(f"Number of predictions: {len(predictions)}, validation dataset size: {len(datamodule.val_dataloader())}", flush=True)
     # print([len(t) for t in predictions], flush=True)
     # print([len(p) for t in predictions for p in t], flush=True)
     print(f"The default process group of torch.distributed is initialized: {torch.distributed.is_initialized()}")
     print(f"Backend used for torch.distributed: {torch.distributed.get_backend()}")
     print(f"Rank: {torch.distributed.get_rank()}, world size: {torch.distributed.get_world_size()}")
+    print(gpt_model.model.config)
     # print(len(predictions), flush=True)
-
-    # gpt_model.eval()
-    # save_dir = f'{args.out_dir}/{model_name.replace("/", "_")}'
-    # gpt_model.model.save_pretrained(save_dir)
-    # tokenizer.save_pretrained(save_dir)
+    # print(f"Number of predictions: {len(global_predictions)}")
