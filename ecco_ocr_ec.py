@@ -86,7 +86,8 @@ class GPTModel(pl.LightningModule):
         self.log('val_loss', self(batch).loss, prog_bar=True, sync_dist=True)
 
     def predict_step(self, batch, batch_idx):
-        # print(f"Batch in predict_step: {batch}")
+        # print(f"Batch in predict_step: {batch}", flush=True)
+        print(f"Running inference for batch {batch_idx}", flush=True)
         max_value = torch.tensor([[max_length]]).cuda()
         # print("Batch devices: ", {k: batch[k].get_device() for k in batch.keys()})
         output = [self.model.generate(torch.unsqueeze(p[:l], 0), do_sample=False, max_length=max_length).squeeze() for p, l in zip(batch['input_ids'], batch['prefix_length'])]
@@ -353,13 +354,14 @@ if __name__ == '__main__':
             "overlap_comm": True,
             "contiguous_gradients": True,
             "sub_group_size": 1e12,
-            "reduce_bucket_size": "auto",
-            "stage3_prefetch_bucket_size": "auto",
-            "stage3_param_persistence_threshold": "auto",
+            "reduce_bucket_size": 'auto',
+            "stage3_prefetch_bucket_size": 'auto',
+            "stage3_param_persistence_threshold": 'auto',
             "stage3_max_live_parameters": 1e9,
             "stage3_max_reuse_distance": 1e9,
             "stage3_gather_16bit_weights_on_model_save": True
         },
+        'train_micro_batch_size_per_gpu': local_batch_size,
         'bf16': {
             'enabled': False
         },
