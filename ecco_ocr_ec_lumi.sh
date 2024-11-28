@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --account=Project_462000347
-#SBATCH --time=3:00:00
-##SBATCH --time=0:15:00
+#SBATCH --account=Project_462000587
+##SBATCH --time=12:00:00
+#SBATCH --time=2:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=8
-#SBATCH --cpus-per-task=7
-#SBATCH --mem=480G
-#SBATCH --partition=small-g
-#SBATCH --gpus-per-task=mi250:1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=56
+#SBATCH --mem=0
+#SBATCH --partition=dev-g
+#SBATCH --gpus-per-task=mi250:8
 #SBATCH --exclusive
 
 echo "Slurm job ID: $SLURM_JOB_ID"
@@ -69,10 +69,10 @@ echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 
 export TMPDIR=$LOCAL_SCRATCH
 # export PYTORCH_PRETRAINED_BERT_CACHE=$TMPDIR
-export TORCH_HOME=/flash/project_462000241/rastasii
-export HF_HOME=$TMPDIR
+export TORCH_HOME=/scratch/project_462000587/rastasii/cache
+export HF_HOME=/scratch/project_462000587/rastasii/cache
 # export HF_DATASETS_CACHE=$TMPDIR
-export TRANSFORMERS_CACHE=/scratch/project_462000241/rastasii/transformers_cache
+# export TRANSFORMERS_CACHE=/scratch/project_462000347/rastasii/cache
 # export OMP_NUM_THREADS=8
 export HF_EVALUATE_OFFLINE=1
 
@@ -124,9 +124,14 @@ then
     srun --label python ecco_ocr_ec.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR
 elif [ $# -eq 4 ]
 then
-    python $4/zero_to_fp32.py $4 $4/pytorch_model.bin
+    # python $4/zero_to_fp32.py $4 $4/pytorch_model.bin
     # srun --label python ecco_ocr_ec.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR --load_checkpoint $4
     # scontrol show hostnames "$SLURM_JOB_NODELIST"
     # export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-    python -m accelerate.commands.launch --num_processes $(($NNODES * $NGPUS)) ecco_ocr_ec_eval.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR --load_checkpoint $4
+    # python -m accelerate.commands.launch --num_processes $(($NNODES * $NGPUS)) ecco_ocr_ec_eval.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --out_dir $OUTDIR --load_checkpoint $4
+    # python -m accelerate.commands.launch --num_processes $(($NNODES * $NGPUS)) ocr_ec_inference.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --predictions $TMPDIR/predictions.jsonl --references $TMPDIR/references.jsonl --load_checkpoint $4
+    # singularity_wrapper exec deepspeed ocr_ec_inference.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --predictions $TMPDIR/predictions.jsonl --references $TMPDIR/references.jsonl --load_checkpoint $4
+    # python extract_ckpt_from_pl.py --ds_checkpoint $4 --model_path $4
+    srun --label python ocr_ec_inference.py --nodes $NNODES --gpus $NGPUS --train $TMPDIR/train.jsonl --eval $TMPDIR/eval.jsonl --predictions $TMPDIR/predictions.jsonl --references $TMPDIR/references.jsonl --load_checkpoint $4
+    python ../ocr-postcorrection-lm/evaluation/eval_metrics.py -p $TMPDIR/predictions.jsonl -r $TMPDIR/references.jsonl -m all
 fi

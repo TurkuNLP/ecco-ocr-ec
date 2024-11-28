@@ -21,11 +21,12 @@ import seaborn as sns
 # model_name = 'facebook/opt-13b'
 # model_name = 'EleutherAI/gpt-neo-2.7B'
 # model_name = 'EleutherAI/gpt-j-6B'
-model_name = 'EleutherAI/gpt-neox-20b'
+# model_name = 'EleutherAI/gpt-neox-20b'
 # model_name = 'EleutherAI/pythia-6.9b'
 # model_name = 'EleutherAI/pythia-12b'
 # model_name = 'stabilityai/stablelm-base-alpha-7b-v2'
 # model_name = 'moreh/MoMo-70B-lora-1.8.6-DPO'
+model_name = 'LumiOpen/Poro-34B'
 tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
 # print(f"Pad token: {tokenizer.pad_token}")
@@ -63,12 +64,16 @@ class GPTModel(pl.LightningModule):
             print(f"DeepSpeed configuration: {self.trainer.strategy.config}")
             self.dsconfig = transformers.deepspeed.HfDeepSpeedConfig(self.trainer.strategy.config)
             self.model = transformers.AutoModelForCausalLM.from_pretrained(self.model_name, trust_remote_code=False, torch_dtype=torch.float32, use_cache=True)
+            # HuggingFace models are loaded in evaluation mode.
+            self.model.train()
             self.model.gradient_checkpointing_enable()
 
     def forward(self, batch):
         return self.model(input_ids=batch['input_ids'],
                           attention_mask=batch['attention_mask'],
                           labels=batch['labels'])
+        # print(f"Computing batch {self.batch_idx}", flush=True)
+        # self.batch_idx += 1
         # print(f"{self.batch_idx} {int(torch.min(batch['input_ids']))} {int(torch.max(batch['input_ids']))} {int(torch.min(batch['attention_mask']))} {int(torch.max(batch['attention_mask']))} {int(torch.min(batch['labels']))} {int(torch.max(batch['labels']))}, {batch['input_ids'].shape[1]} {batch['attention_mask'].shape[1]} {batch['labels'].shape[1]}", flush=True)
         # print(f"{self.batch_idx} done", flush=True)
         # self.batch_idx += 1
@@ -105,7 +110,7 @@ class GPTModel(pl.LightningModule):
         # optimizer = deepspeed.ops.adam.FusedAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
         optimizer = torch.optim.AdamW(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
         # optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(self.trainer.model.parameters(), lr=self.lr, weight_decay=0.01)
-        scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=self.steps_train)
+        scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=200, num_training_steps=self.steps_train)
         scheduler = {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
         return [optimizer], [scheduler]
 
@@ -222,10 +227,10 @@ if __name__ == '__main__':
 
     accumulate_grad_batches = 1
     # steps_train = 80000
-    lr = 2e-5
+    lr = 1e-5
     local_batch_size = 1
     max_length = 2048
-    train_size = 500000
+    train_size = 20000
     eval_size = 1000
 
     print(f"PyTorch version: {torch.__version__}")
@@ -256,8 +261,9 @@ if __name__ == '__main__':
     # print(f"Average OCR page length in test: {sum([len(d['ocr']) for d in page_pairs])/len(page_pairs)}")
     # print(f"Average clean page length in test: {sum([len(d['tcp']) for d in page_pairs])/len(page_pairs)}")
 
-    dataset = datasets.load_dataset('json', data_files={'train': args.train, 'test': args.eval})
-    dataset['test'] = dataset['test'].select(range(eval_size))
+    dataset_train = datasets.load_dataset('json', data_files={'train': args.train}, split='train')
+    dataset_test = datasets.load_dataset('json', data_files={'test': args.eval}, split=f'test[:{eval_size}]')
+    dataset = datasets.DatasetDict({'train': dataset_train, 'test': dataset_test})
     # dataset['train'] = dataset['train'].select(range(min(train_size, len(dataset['train']))))
     # print(dataset['test'][0])
     # print(dataset['test'][-1])
@@ -302,7 +308,7 @@ if __name__ == '__main__':
         num_proc=4
     )
 
-    dataset = dataset.remove_columns(['input', 'output'])
+    dataset = dataset.select_columns(['input_ids', 'attention_mask', 'prefix_length'])
     # Inputs longer than the maximum length of the model are removed from the dataset.
     dataset = filter_by_length(dataset, max_length)
 
@@ -324,15 +330,16 @@ if __name__ == '__main__':
     gpt_model = GPTModel(model_name, lr, steps_train)
 
     references = []
+    print(datamodule)
     for batch in datamodule.val_dataloader():
         references += [o[l:torch.nonzero(o == tokenizer.eos_token_id)[0]] for o, l in zip(batch['input_ids'], batch['prefix_length'])]
     references = tokenizer.batch_decode(references)
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=steps_train, monitor='global_step', mode='max', save_top_k=-1, dirpath=args.out_dir, filename=(model_name+'-{global_step}').replace('/', '_'))
-    checkpoint_epoch_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=1, save_on_train_epoch_end=True, save_top_k=-1, dirpath=args.out_dir, filename=(model_name+'-{epoch}').replace('/', '_'))
+    # checkpoint_epoch_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=1, save_on_train_epoch_end=True, save_top_k=-1, dirpath=args.out_dir, filename=(model_name+'-{epoch}').replace('/', '_'))
     # checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=1, dirpath=args.out_dir, filename=model_name+'-{epoch}')
 
-    logger = pl.loggers.TensorBoardLogger('tb_logs', name=f"{model_name}-{train_size}".replace('/', '_'))
+    logger = pl.loggers.TensorBoardLogger('/project/project_462000587/rastasii/ecco_ocr/tb_logs', name=f"{model_name}-{train_size}".replace('/', '_'))
 
     # fsdp = pl.strategies.DDPFullyShardedNativeStrategy(
     #     cpu_offload=torch.distributed.fsdp.fully_sharded_data_parallel.CPUOffload(offload_params=True),
@@ -348,7 +355,7 @@ if __name__ == '__main__':
                 "pin_memory": True
             },
             "offload_param": {
-                "device": 'cpu',
+                "device": 'none',
                 "pin_memory": True
             },
             "overlap_comm": True,
@@ -402,7 +409,7 @@ if __name__ == '__main__':
         # limit_val_batches=0.0,
         # max_epochs=1,
         max_steps=steps_train,
-        callbacks=[checkpoint_callback, checkpoint_epoch_callback, pl.callbacks.TQDMProgressBar(refresh_rate=10), PredWriter(references=references, write_interval='epoch')],
+        callbacks=[checkpoint_callback, pl.callbacks.TQDMProgressBar(refresh_rate=10), PredWriter(references=references, write_interval='epoch')],
         logger=logger
     )
 
@@ -413,7 +420,7 @@ if __name__ == '__main__':
     # Use predict_step to speed up evaluation.
     # print("Evaluating.")
     # start = time.time()
-    # trainer.predict(gpt_model, datamodule.val_dataloader())
+    # trainer.predict(gpt_model, dataloaders=datamodule.val_dataloader(), ckpt_path=args.load_checkpoint)
     # TODO: Compare performance between setting use_cache to True or leaving it as False.
     # gpt_model.model.config.use_cache = True
     # print(f"Validation dataloader length: {len(datamodule.val_dataloader())}")
@@ -432,9 +439,10 @@ if __name__ == '__main__':
     # print(f"Number of predictions: {len(predictions)}, validation dataset size: {len(datamodule.val_dataloader())}", flush=True)
     # print([len(t) for t in predictions], flush=True)
     # print([len(p) for t in predictions for p in t], flush=True)
-    print(f"The default process group of torch.distributed is initialized: {torch.distributed.is_initialized()}")
-    print(f"Backend used for torch.distributed: {torch.distributed.get_backend()}")
-    print(f"Rank: {torch.distributed.get_rank()}, world size: {torch.distributed.get_world_size()}")
-    print(gpt_model.model.config)
+    if trainer.is_global_zero:
+        print(f"The default process group of torch.distributed is initialized: {torch.distributed.is_initialized()}")
+        print(f"Backend used for torch.distributed: {torch.distributed.get_backend()}")
+        print(f"Rank: {torch.distributed.get_rank()}, world size: {torch.distributed.get_world_size()}")
+        print(gpt_model.model.config)
     # print(len(predictions), flush=True)
     # print(f"Number of predictions: {len(global_predictions)}")
